@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,8 @@ var (
 			MaxConnsPerHost:       100,
 		},
 	}
+	// API Key loaded from environment variable
+	apiKey string
 )
 
 func init() {
@@ -40,6 +43,12 @@ func init() {
 	mime.AddExtensionType(".js", "application/javascript")
 	mime.AddExtensionType(".css", "text/css")
 	mime.AddExtensionType(".json", "application/json")
+
+	// Load API key from environment variable
+	apiKey = os.Getenv("API_KEY")
+	if apiKey == "" {
+		log.Fatal("API_KEY environment variable is not set")
+	}
 }
 
 func main() {
@@ -47,7 +56,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// Register handlers
-	http.HandleFunc("/", limitRate(limitSize(handler)))
+	http.HandleFunc("/", limitRate(limitSize(authenticateAndValidate(handler))))
 
 	// Start server
 	log.Println("Starting server on :3047")
@@ -88,17 +97,6 @@ func prepareURL(rawURL string) (string, error) {
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-
-	// Handle OPTIONS method
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	// Get URL from query parameter
 	targetURL := r.URL.Query().Get("url")
 	if targetURL == "" {
@@ -145,17 +143,20 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Check Content-Type for image
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "image/") {
+		log.Printf("Rejected non-image content from %q", preparedURL)
+		http.Error(w, "Only image content is allowed", http.StatusForbidden)
+		return
+	}
+
 	// Copy response headers
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
-
-	// Ensure CORS headers are set
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
 
 	// Write status code
 	w.WriteHeader(resp.StatusCode)
@@ -202,6 +203,27 @@ func limitRate(next http.HandlerFunc) http.HandlerFunc {
 func limitSize(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		next(w, r)
+	}
+}
+
+func authenticateAndValidate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Allow only GET requests
+		if r.Method != "GET" {
+			log.Printf("Rejected non-GET request from %s", r.RemoteAddr)
+			http.Error(w, "Only GET method is allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Check for valid API key
+		providedKey := r.Header.Get("X-API-Key")
+		if providedKey != apiKey {
+			log.Printf("Rejected request with invalid API key from %s", r.RemoteAddr)
+			http.Error(w, "Invalid API key", http.StatusUnauthorized)
+			return
+		}
+
 		next(w, r)
 	}
 }
